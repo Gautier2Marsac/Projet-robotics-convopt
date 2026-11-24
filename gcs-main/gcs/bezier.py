@@ -12,7 +12,7 @@ from pydrake.math import (
     BsplineBasis_,
     KnotVectorType,
 )
-from pydrake.solvers import(
+from pydrake.solvers import (
     Binding,
     Constraint,
     Cost,
@@ -20,6 +20,7 @@ from pydrake.solvers import(
     LinearConstraint,
     LinearCost,
     LinearEqualityConstraint,
+    LorentzConeConstraint,
     QuadraticCost,
     PerspectiveQuadraticCost,
 )
@@ -37,83 +38,194 @@ from pydrake.trajectories import (
 
 from gcs.base import BaseGCS
 
+
 class BezierGCS(BaseGCS):
-    def __init__(self, regions, order, continuity, edges=None, hdot_min=1e-6, full_dim_overlap=False):
-        BaseGCS.__init__(self, regions)
+    def __init__(
+        self,
+        regions,
+        order,
+        continuity,
+        edges=None,
+        hdot_min=1e-6,
+        full_dim_overlap=False,
+        waypoints=None,
+        waypoint_radii=None,
+        allow_cross_region_waypoints=True,
+        T_max=1e3,
+    ):
+        self.waypoints = (
+            [np.asarray(wp, dtype=float) for wp in waypoints]
+            if waypoints is not None
+            else []
+        )
+        num_layers = len(self.waypoints) + 1
+        BaseGCS.__init__(self, regions, num_layers=num_layers)
 
         self.order = order
         self.continuity = continuity
         assert continuity < order
 
-        A_time = np.vstack((np.eye(order + 1), -np.eye(order + 1),
-                            np.eye(order, order + 1) - np.eye(order, order + 1, 1)))
-        b_time = np.concatenate((1e3*np.ones(order + 1), np.zeros(order + 1), -hdot_min * np.ones(order)))
+        A_time = np.vstack(
+            (
+                np.eye(order + 1),
+                -np.eye(order + 1),
+                np.eye(order, order + 1) - np.eye(order, order + 1, 1),
+            )
+        )
+        b_time = np.concatenate(
+            (
+                T_max * np.ones(order + 1),
+                np.zeros(order + 1),
+                -hdot_min * np.ones(order),
+            )
+        )
         self.time_scaling_set = HPolyhedron(A_time, b_time)
 
-        for i, r in enumerate(self.regions):
-            self.gcs.AddVertex(
-                r.CartesianPower(order + 1).CartesianProduct(self.time_scaling_set),
-                name = self.names[i] if not self.names is None else '')
+        # Build convex sets once per region and instantiate them across all layers
+        region_vertex_sets = [
+            r.CartesianPower(order + 1).CartesianProduct(self.time_scaling_set)
+            for r in self.regions
+        ]
+        for layer in range(self.num_layers):
+            for i in range(self.num_regions):
+                self.gcs.AddVertex(
+                    region_vertex_sets[i],
+                    name=self.vertexName(layer, i),
+                )
 
         # Formulate edge costs and constraints
         u_control = MakeMatrixContinuousVariable(
-            self.dimension, order + 1, "xu")
+            self.dimension, order + 1, "xu"
+        )
         v_control = MakeMatrixContinuousVariable(
-            self.dimension, order + 1, "xv")
+            self.dimension, order + 1, "xv"
+        )
         u_duration = MakeVectorContinuousVariable(order + 1, "Tu")
         v_duration = MakeVectorContinuousVariable(order + 1, "Tv")
 
         self.u_vars = np.concatenate((u_control.flatten("F"), u_duration))
         self.u_r_trajectory = BsplineTrajectory_[Expression](
-            BsplineBasis_[Expression](order + 1, order + 1, KnotVectorType.kClampedUniform, 0., 1.),
-            u_control)
+            BsplineBasis_[Expression](
+                order + 1, order + 1, KnotVectorType.kClampedUniform, 0.0, 1.0
+            ),
+            u_control,
+        )
         self.u_h_trajectory = BsplineTrajectory_[Expression](
-            BsplineBasis_[Expression](order + 1, order + 1, KnotVectorType.kClampedUniform, 0., 1.),
-            np.expand_dims(u_duration, 0))
+            BsplineBasis_[Expression](
+                order + 1, order + 1, KnotVectorType.kClampedUniform, 0.0, 1.0
+            ),
+            np.expand_dims(u_duration, 0),
+        )
 
-        edge_vars = np.concatenate((u_control.flatten("F"), u_duration, v_control.flatten("F"), v_duration))
+        edge_vars = np.concatenate(
+            (
+                u_control.flatten("F"),
+                u_duration,
+                v_control.flatten("F"),
+                v_duration,
+            )
+        )
         v_r_trajectory = BsplineTrajectory_[Expression](
-            BsplineBasis_[Expression](order + 1, order + 1, KnotVectorType.kClampedUniform, 0., 1.),
-            v_control)
+            BsplineBasis_[Expression](
+                order + 1, order + 1, KnotVectorType.kClampedUniform, 0.0, 1.0
+            ),
+            v_control,
+        )
         v_h_trajectory = BsplineTrajectory_[Expression](
-            BsplineBasis_[Expression](order + 1, order + 1, KnotVectorType.kClampedUniform, 0., 1.),
-            np.expand_dims(v_duration, 0))
+            BsplineBasis_[Expression](
+                order + 1, order + 1, KnotVectorType.kClampedUniform, 0.0, 1.0
+            ),
+            np.expand_dims(v_duration, 0),
+        )
 
-        # Continuity constraints
+        # Continuity constraints (C^continuity on both spatial path r and clock h)
         self.contin_constraints = []
         for deriv in range(continuity + 1):
             u_path_deriv = self.u_r_trajectory.MakeDerivative(deriv)
             v_path_deriv = v_r_trajectory.MakeDerivative(deriv)
-            path_continuity_error = v_path_deriv.control_points()[0] - u_path_deriv.control_points()[-1]
-            self.contin_constraints.append(LinearEqualityConstraint(
-                DecomposeLinearExpressions(path_continuity_error, edge_vars),
-                np.zeros(self.dimension)))
+            path_continuity_error = (
+                v_path_deriv.control_points()[0]
+                - u_path_deriv.control_points()[-1]
+            )
+            self.contin_constraints.append(
+                LinearEqualityConstraint(
+                    DecomposeLinearExpressions(path_continuity_error, edge_vars),
+                    np.zeros(self.dimension),
+                )
+            )
 
             u_time_deriv = self.u_h_trajectory.MakeDerivative(deriv)
             v_time_deriv = v_h_trajectory.MakeDerivative(deriv)
-            time_continuity_error = v_time_deriv.control_points()[0] - u_time_deriv.control_points()[-1]
-            self.contin_constraints.append(LinearEqualityConstraint(
-                DecomposeLinearExpressions(time_continuity_error, edge_vars), 0.0))
+            time_continuity_error = (
+                v_time_deriv.control_points()[0]
+                - u_time_deriv.control_points()[-1]
+            )
+            self.contin_constraints.append(
+                LinearEqualityConstraint(
+                    DecomposeLinearExpressions(time_continuity_error, edge_vars),
+                    0.0,
+                )
+            )
 
         self.deriv_constraints = []
         self.edge_costs = []
+        self.waypoint_edges = {k: [] for k in range(len(self.waypoints))}
+        self.waypoint_edge_to_idx = {}
 
-        # Add edges to graph and apply costs/constraints
-        if edges is None:
-            if full_dim_overlap:
-                edges = self.findEdgesViaFullDimensionOverlaps()
-            else:
-                edges = self.findEdgesViaOverlaps()
-
+        # 1) Add intra-layer edges across all layers
+        layered_edges = self.findLayeredIntraEdges(
+            base_edges=edges, full_dim_overlap=full_dim_overlap
+        )
         vertices = self.gcs.Vertices()
-        for ii, jj in edges:
+        for ii, jj in layered_edges:
             u = vertices[ii]
             v = vertices[jj]
             edge = self.gcs.AddEdge(u, v, f"({u.name()}, {v.name()})")
 
             for c_con in self.contin_constraints:
-                edge.AddConstraint(Binding[Constraint](
-                        c_con, np.append(u.x(), v.x())))
+                edge.AddConstraint(
+                    Binding[Constraint](c_con, np.append(u.x(), v.x()))
+                )
+
+        # 2) Add inter-layer fly-by waypoint transition edges (if waypoints provided)
+        if len(self.waypoints) > 0:
+            u_end_pos = np.reshape(
+                self.u_r_trajectory.control_points()[-1], (self.dimension,)
+            )
+            A_end = DecomposeLinearExpressions(u_end_pos, self.u_vars)
+
+            transition_edges = self.findWaypointTransitionEdges(
+                self.waypoints,
+                radii=waypoint_radii,
+                allow_cross_region=allow_cross_region_waypoints,
+            )
+            for k, u_idx, v_idx, wp, rad in transition_edges:
+                u = vertices[u_idx]
+                v = vertices[v_idx]
+                edge = self.gcs.AddEdge(
+                    u, v, f"({u.name()}, {v.name()})_wp{k}"
+                )
+
+                # Enforce full C^continuity across the waypoint (no forced stop)
+                for c_con in self.contin_constraints:
+                    edge.AddConstraint(
+                        Binding[Constraint](c_con, np.append(u.x(), v.x()))
+                    )
+
+                # Enforce waypoint passage on r_{u, d} (and hence r_{v, 0} by C^0)
+                if rad == 0.0:
+                    wp_con = LinearEqualityConstraint(A_end, wp)
+                else:
+                    # Lorentz cone: [rad; r_{u, d} - wp] in L  <=>  ||r_{u, d} - wp||_2 <= rad
+                    A_cone = np.vstack(
+                        (np.zeros((1, len(self.u_vars))), A_end)
+                    )
+                    b_cone = np.concatenate(([rad], -wp))
+                    wp_con = LorentzConeConstraint(A_cone, b_cone)
+
+                edge.AddConstraint(Binding[Constraint](wp_con, edge.xu()))
+                self.waypoint_edges[k].append(edge)
+                self.waypoint_edge_to_idx[edge.id()] = k
 
     def addTimeCost(self, weight):
         assert isinstance(weight, float) or isinstance(weight, int)
@@ -121,7 +233,9 @@ class BezierGCS(BaseGCS):
         u_time_control = self.u_h_trajectory.control_points()
         segment_time = u_time_control[-1] - u_time_control[0]
         time_cost = LinearCost(
-            weight * DecomposeLinearExpressions(segment_time, self.u_vars)[0], 0.)
+            weight * DecomposeLinearExpressions(segment_time, self.u_vars)[0],
+            0.0,
+        )
         self.edge_costs.append(time_cost)
 
         for edge in self.gcs.Edges():
@@ -133,13 +247,17 @@ class BezierGCS(BaseGCS):
         if isinstance(weight, float) or isinstance(weight, int):
             weight_matrix = weight * np.eye(self.dimension)
         else:
-            assert(len(weight) == self.dimension)
+            assert len(weight) == self.dimension
             weight_matrix = np.diag(weight)
 
         u_path_control = self.u_r_trajectory.MakeDerivative(1).control_points()
         for ii in range(len(u_path_control)):
-            H = DecomposeLinearExpressions(u_path_control[ii] / self.order, self.u_vars)
-            path_cost = L2NormCost(np.matmul(weight_matrix, H), np.zeros(self.dimension))
+            H = DecomposeLinearExpressions(
+                u_path_control[ii] / self.order, self.u_vars
+            )
+            path_cost = L2NormCost(
+                np.matmul(weight_matrix, H), np.zeros(self.dimension)
+            )
             self.edge_costs.append(path_cost)
 
             for edge in self.gcs.Edges():
@@ -151,10 +269,10 @@ class BezierGCS(BaseGCS):
         if isinstance(weight, float) or isinstance(weight, int):
             weight_matrix = weight * np.eye(self.dimension)
         else:
-            assert(len(weight) == self.dimension)
+            assert len(weight) == self.dimension
             weight_matrix = np.diag(weight)
 
-        s_points = np.linspace(0., 1., integration_points + 1)
+        s_points = np.linspace(0.0, 1.0, integration_points + 1)
         u_path_deriv = self.u_r_trajectory.MakeDerivative(1)
 
         if u_path_deriv.basis().order() == 1:
@@ -164,7 +282,9 @@ class BezierGCS(BaseGCS):
                 for ii in range(self.dimension):
                     costs.append(q_ds[ii])
                 H = DecomposeLinearExpressions(costs, self.u_vars)
-                integral_cost = L2NormCost(np.matmul(weight_matrix, H), np.zeros(self.dimension))
+                integral_cost = L2NormCost(
+                    np.matmul(weight_matrix, H), np.zeros(self.dimension)
+                )
                 self.edge_costs.append(integral_cost)
 
                 for edge in self.gcs.Edges():
@@ -177,11 +297,15 @@ class BezierGCS(BaseGCS):
                 costs = []
                 for jj in range(self.dimension):
                     if ii == 0 or ii == integration_points:
-                        costs.append(0.5 * 1./integration_points * q_ds[jj, ii])
+                        costs.append(
+                            0.5 * 1.0 / integration_points * q_ds[jj, ii]
+                        )
                     else:
-                        costs.append(1./integration_points * q_ds[jj, ii])
+                        costs.append(1.0 / integration_points * q_ds[jj, ii])
                 H = DecomposeLinearExpressions(costs, self.u_vars)
-                integral_cost = L2NormCost(np.matmul(weight_matrix, H), np.zeros(self.dimension))
+                integral_cost = L2NormCost(
+                    np.matmul(weight_matrix, H), np.zeros(self.dimension)
+                )
                 self.edge_costs.append(integral_cost)
 
                 for edge in self.gcs.Edges():
@@ -193,15 +317,24 @@ class BezierGCS(BaseGCS):
         if isinstance(weight, float) or isinstance(weight, int):
             weight_matrix = weight * np.eye(self.dimension)
         else:
-            assert(len(weight) == self.dimension)
+            assert len(weight) == self.dimension
             weight_matrix = np.diag(weight)
 
         u_path_control = self.u_r_trajectory.MakeDerivative(1).control_points()
         u_time_control = self.u_h_trajectory.MakeDerivative(1).control_points()
         for ii in range(len(u_path_control)):
-            A_ctrl = DecomposeLinearExpressions(u_path_control[ii], self.u_vars)
-            b_ctrl = DecomposeLinearExpressions(u_time_control[ii], self.u_vars)
-            H = np.vstack(((self.order) * b_ctrl, np.matmul(np.sqrt(weight_matrix), A_ctrl)))
+            A_ctrl = DecomposeLinearExpressions(
+                u_path_control[ii], self.u_vars
+            )
+            b_ctrl = DecomposeLinearExpressions(
+                u_time_control[ii], self.u_vars
+            )
+            H = np.vstack(
+                (
+                    (self.order) * b_ctrl,
+                    np.matmul(np.sqrt(weight_matrix), A_ctrl),
+                )
+            )
             energy_cost = PerspectiveQuadraticCost(H, np.zeros(H.shape[0]))
             self.edge_costs.append(energy_cost)
 
@@ -215,15 +348,21 @@ class BezierGCS(BaseGCS):
         assert isinstance(order, int) and 2 <= order <= self.order
         weights = [weight_r, weight_h]
         for weight in weights:
-            assert isinstance(weight, float) or isinstance(weight, int)
+            assert (isinstance(weight, float) or isinstance(weight, int)) and weight >= 0
 
         trajectories = [self.u_r_trajectory, self.u_h_trajectory]
         for traj, weight in zip(trajectories, weights):
+            if weight == 0:
+                continue
+            scale = np.sqrt(weight / (1 + self.order - order))
             derivative_control = traj.MakeDerivative(order).control_points()
             for c in derivative_control:
                 A_ctrl = DecomposeLinearExpressions(c, self.u_vars)
-                H = A_ctrl.T.dot(A_ctrl) * 2 * weight / (1 + self.order - order)
-                reg_cost = QuadraticCost(H, np.zeros(H.shape[0]), 0)
+                # Direct factored form avoids rank-deficient H = A^T A numerical issues in MOSEK
+                H_p = np.vstack((np.zeros((1, len(self.u_vars))), scale * A_ctrl))
+                b_p = np.zeros(H_p.shape[0])
+                b_p[0] = 1.0
+                reg_cost = PerspectiveQuadraticCost(H_p, b_p)
                 self.edge_costs.append(reg_cost)
 
                 for edge in self.gcs.Edges():
@@ -241,11 +380,20 @@ class BezierGCS(BaseGCS):
         ub = np.expand_dims(upper_bound, 1)
 
         for ii in range(len(u_path_control)):
-            A_ctrl = DecomposeLinearExpressions(u_path_control[ii], self.u_vars)
-            b_ctrl = DecomposeLinearExpressions(u_time_control[ii], self.u_vars)
-            A_constraint = np.vstack((A_ctrl - ub * b_ctrl, -A_ctrl + lb * b_ctrl))
+            A_ctrl = DecomposeLinearExpressions(
+                u_path_control[ii], self.u_vars
+            )
+            b_ctrl = DecomposeLinearExpressions(
+                u_time_control[ii], self.u_vars
+            )
+            A_constraint = np.vstack(
+                (A_ctrl - ub * b_ctrl, -A_ctrl + lb * b_ctrl)
+            )
             velocity_con = LinearConstraint(
-                A_constraint, -np.inf*np.ones(2*self.dimension), np.zeros(2*self.dimension))
+                A_constraint,
+                -np.inf * np.ones(2 * self.dimension),
+                np.zeros(2 * self.dimension),
+            )
             self.deriv_constraints.append(velocity_con)
 
             for edge in self.gcs.Edges():
@@ -253,56 +401,88 @@ class BezierGCS(BaseGCS):
                     continue
                 edge.AddConstraint(Binding[Constraint](velocity_con, edge.xu()))
 
-    def addSourceTarget(self, source, target, edges=None, velocity=None, zero_deriv_boundary=None):
-        source_edges, target_edges =  super().addSourceTarget(source, target, edges)
+    def addSourceTarget(
+        self, source, target, edges=None, velocity=None, zero_deriv_boundary=None
+    ):
+        source_edges, target_edges = super().addSourceTarget(
+            source, target, edges
+        )
 
         if velocity is not None:
             assert velocity.shape == (2, self.dimension)
 
-            u_path_control = self.u_r_trajectory.MakeDerivative(1).control_points()
-            u_time_control = self.u_h_trajectory.MakeDerivative(1).control_points()
-            initial_velocity_error = np.squeeze(u_path_control[0]) - velocity[0] * np.squeeze(u_time_control[0])
-            final_velocity_error = np.squeeze(u_path_control[-1]) - velocity[1] * np.squeeze(u_time_control[-1])
+            u_path_control = self.u_r_trajectory.MakeDerivative(
+                1
+            ).control_points()
+            u_time_control = self.u_h_trajectory.MakeDerivative(
+                1
+            ).control_points()
+            initial_velocity_error = np.squeeze(u_path_control[0]) - velocity[
+                0
+            ] * np.squeeze(u_time_control[0])
+            final_velocity_error = np.squeeze(u_path_control[-1]) - velocity[
+                1
+            ] * np.squeeze(u_time_control[-1])
             initial_velocity_con = LinearEqualityConstraint(
                 DecomposeLinearExpressions(initial_velocity_error, self.u_vars),
-                np.zeros(self.dimension))
+                np.zeros(self.dimension),
+            )
             final_velocity_con = LinearEqualityConstraint(
                 DecomposeLinearExpressions(final_velocity_error, self.u_vars),
-                np.zeros(self.dimension))
+                np.zeros(self.dimension),
+            )
 
         if zero_deriv_boundary is not None:
             assert self.order > zero_deriv_boundary + 1
             initial_constraints = []
             final_constraints = []
 
-            for deriv in range(1, zero_deriv_boundary+1):
-                u_path_control = self.u_r_trajectory.MakeDerivative(deriv).control_points()
-                initial_constraints.append(LinearEqualityConstraint(
-                    DecomposeLinearExpressions(np.squeeze(u_path_control[0]), self.u_vars),
-                    np.zeros(self.dimension)))
-                final_constraints.append(LinearEqualityConstraint(
-                    DecomposeLinearExpressions(np.squeeze(u_path_control[-1]), self.u_vars),
-                    np.zeros(self.dimension)))
+            for deriv in range(1, zero_deriv_boundary + 1):
+                u_path_control = self.u_r_trajectory.MakeDerivative(
+                    deriv
+                ).control_points()
+                initial_constraints.append(
+                    LinearEqualityConstraint(
+                        DecomposeLinearExpressions(
+                            np.squeeze(u_path_control[0]), self.u_vars
+                        ),
+                        np.zeros(self.dimension),
+                    )
+                )
+                final_constraints.append(
+                    LinearEqualityConstraint(
+                        DecomposeLinearExpressions(
+                            np.squeeze(u_path_control[-1]), self.u_vars
+                        ),
+                        np.zeros(self.dimension),
+                    )
+                )
 
         for edge in source_edges:
             for jj in range(self.dimension):
                 edge.AddConstraint(edge.xu()[jj] == edge.xv()[jj])
 
             if velocity is not None:
-                edge.AddConstraint(Binding[Constraint](initial_velocity_con, edge.xv()))
+                edge.AddConstraint(
+                    Binding[Constraint](initial_velocity_con, edge.xv())
+                )
             if zero_deriv_boundary is not None:
                 for i_con in initial_constraints:
                     edge.AddConstraint(Binding[Constraint](i_con, edge.xv()))
 
-            edge.AddConstraint(edge.xv()[-(self.order + 1)] == 0.)
+            edge.AddConstraint(edge.xv()[-(self.order + 1)] == 0.0)
 
-        for edge in target_edges:    
+        for edge in target_edges:
             for jj in range(self.dimension):
                 edge.AddConstraint(
-                    edge.xu()[-(self.dimension + self.order + 1) + jj] == edge.xv()[jj])
+                    edge.xu()[-(self.dimension + self.order + 1) + jj]
+                    == edge.xv()[jj]
+                )
 
             if velocity is not None:
-                edge.AddConstraint(Binding[Constraint](final_velocity_con, edge.xu()))
+                edge.AddConstraint(
+                    Binding[Constraint](final_velocity_con, edge.xu())
+                )
             if zero_deriv_boundary is not None:
                 for f_con in final_constraints:
                     edge.AddConstraint(Binding[Constraint](f_con, edge.xu()))
@@ -313,29 +493,47 @@ class BezierGCS(BaseGCS):
             for d_con in self.deriv_constraints:
                 edge.AddConstraint(Binding[Constraint](d_con, edge.xu()))
 
-
     def SolvePath(self, rounding=False, verbose=False, preprocessing=False):
         best_path, best_result, results_dict = self.solveGCS(
-            rounding, preprocessing, verbose)
+            rounding, preprocessing, verbose
+        )
 
         if best_path is None:
             return None, results_dict
 
-        # Extract trajectory control points
+        # Extract trajectory control points (and waypoint passage times/positions)
         knots = np.zeros(self.order + 1)
         path_control_points = []
         time_control_points = []
+        waypoint_times = [None] * len(self.waypoints)
+        waypoint_positions = [None] * len(self.waypoints)
+
         for edge in best_path:
+            if edge.id() in self.waypoint_edge_to_idx:
+                wp_idx = self.waypoint_edge_to_idx[edge.id()]
+                xu_sol = best_result.GetSolution(edge.xu())
+                waypoint_positions[wp_idx] = xu_sol[
+                    -(self.dimension + self.order + 1) : -(self.order + 1)
+                ]
+                waypoint_times[wp_idx] = float(xu_sol[-1])
+
             if edge.v() == self.target:
                 knots = np.concatenate((knots, [knots[-1]]))
                 path_control_points.append(best_result.GetSolution(edge.xv()))
-                time_control_points.append(np.array([best_result.GetSolution(edge.xu())[-1]]))
+                time_control_points.append(
+                    np.array([best_result.GetSolution(edge.xu())[-1]])
+                )
                 break
-            edge_time = knots[-1] + 1.
+            edge_time = knots[-1] + 1.0
             knots = np.concatenate((knots, np.full(self.order, edge_time)))
-            edge_path_points = np.reshape(best_result.GetSolution(edge.xv())[:-(self.order + 1)],
-                                             (self.dimension, self.order + 1), "F")
-            edge_time_points = best_result.GetSolution(edge.xv())[-(self.order + 1):]
+            edge_path_points = np.reshape(
+                best_result.GetSolution(edge.xv())[: -(self.order + 1)],
+                (self.dimension, self.order + 1),
+                "F",
+            )
+            edge_time_points = best_result.GetSolution(edge.xv())[
+                -(self.order + 1) :
+            ]
             for ii in range(self.order):
                 path_control_points.append(edge_path_points[:, ii])
                 time_control_points.append(np.array([edge_time_points[ii]]))
@@ -344,13 +542,26 @@ class BezierGCS(BaseGCS):
         for ii in range(len(time_control_points)):
             time_control_points[ii] -= offset
 
+        if len(self.waypoints) > 0:
+            offset_scalar = float(np.squeeze(offset))
+            results_dict["waypoint_times"] = [
+                t - offset_scalar if t is not None else None
+                for t in waypoint_times
+            ]
+            results_dict["waypoint_positions"] = waypoint_positions
+
         path_control_points = np.array(path_control_points).T
         time_control_points = np.array(time_control_points).T
 
-        path = BsplineTrajectory(BsplineBasis(self.order + 1, knots), path_control_points)
-        time_traj = BsplineTrajectory(BsplineBasis(self.order + 1, knots), time_control_points)
+        path = BsplineTrajectory(
+            BsplineBasis(self.order + 1, knots), path_control_points
+        )
+        time_traj = BsplineTrajectory(
+            BsplineBasis(self.order + 1, knots), time_control_points
+        )
 
         return BezierTrajectory(path, time_traj), results_dict
+
 
 class BezierTrajectory:
     def __init__(self, path_traj, time_traj):
@@ -382,20 +593,19 @@ class BezierTrajectory:
             return self.value(t)
         elif derivative_order == 1:
             s = self.invert_time_traj(np.squeeze(t))
-            s_dot = 1./self.time_traj.EvalDerivative(s, 1)[0, 0]
+            s_dot = 1.0 / self.time_traj.EvalDerivative(s, 1)[0, 0]
             r_dot = self.path_traj.EvalDerivative(s, 1)
             return r_dot * s_dot
         elif derivative_order == 2:
             s = self.invert_time_traj(np.squeeze(t))
-            s_dot = 1./self.time_traj.EvalDerivative(s, 1)[0, 0]
+            s_dot = 1.0 / self.time_traj.EvalDerivative(s, 1)[0, 0]
             h_ddot = self.time_traj.EvalDerivative(s, 2)[0, 0]
-            s_ddot = -h_ddot*(s_dot**3)
+            s_ddot = -h_ddot * (s_dot**3)
             r_dot = self.path_traj.EvalDerivative(s, 1)
             r_ddot = self.path_traj.EvalDerivative(s, 2)
             return r_ddot * s_dot * s_dot + r_dot * s_ddot
         else:
             raise ValueError()
-
 
     def start_time(self):
         return self.time_traj.value(self.start_s)[0, 0]
