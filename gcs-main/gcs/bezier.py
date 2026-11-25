@@ -51,6 +51,7 @@ class BezierGCS(BaseGCS):
         waypoints=None,
         waypoint_radii=None,
         allow_cross_region_waypoints=True,
+        ordered=True,
         T_max=1e3,
     ):
         self.waypoints = (
@@ -58,7 +59,14 @@ class BezierGCS(BaseGCS):
             if waypoints is not None
             else []
         )
-        num_layers = len(self.waypoints) + 1
+        self.ordered = ordered
+        if len(self.waypoints) == 0:
+            num_layers = 1
+        elif ordered:
+            num_layers = len(self.waypoints) + 1
+        else:
+            num_layers = 1 << len(self.waypoints)
+
         BaseGCS.__init__(self, regions, num_layers=num_layers)
 
         self.order = order
@@ -187,7 +195,7 @@ class BezierGCS(BaseGCS):
                     Binding[Constraint](c_con, np.append(u.x(), v.x()))
                 )
 
-        # 2) Add inter-layer fly-by waypoint transition edges (if waypoints provided)
+        # 2) Add inter-layer fly-by waypoint transition edges (ordered or TSP bitmask DAG)
         if len(self.waypoints) > 0:
             u_end_pos = np.reshape(
                 self.u_r_trajectory.control_points()[-1], (self.dimension,)
@@ -198,6 +206,7 @@ class BezierGCS(BaseGCS):
                 self.waypoints,
                 radii=waypoint_radii,
                 allow_cross_region=allow_cross_region_waypoints,
+                ordered=self.ordered,
             )
             for k, u_idx, v_idx, wp, rad in transition_edges:
                 u = vertices[u_idx]
@@ -348,7 +357,9 @@ class BezierGCS(BaseGCS):
         assert isinstance(order, int) and 2 <= order <= self.order
         weights = [weight_r, weight_h]
         for weight in weights:
-            assert (isinstance(weight, float) or isinstance(weight, int)) and weight >= 0
+            assert (
+                isinstance(weight, float) or isinstance(weight, int)
+            ) and weight >= 0
 
         trajectories = [self.u_r_trajectory, self.u_h_trajectory]
         for traj, weight in zip(trajectories, weights):
@@ -359,7 +370,9 @@ class BezierGCS(BaseGCS):
             for c in derivative_control:
                 A_ctrl = DecomposeLinearExpressions(c, self.u_vars)
                 # Direct factored form avoids rank-deficient H = A^T A numerical issues in MOSEK
-                H_p = np.vstack((np.zeros((1, len(self.u_vars))), scale * A_ctrl))
+                H_p = np.vstack(
+                    (np.zeros((1, len(self.u_vars))), scale * A_ctrl)
+                )
                 b_p = np.zeros(H_p.shape[0])
                 b_p[0] = 1.0
                 reg_cost = PerspectiveQuadraticCost(H_p, b_p)
@@ -501,16 +514,18 @@ class BezierGCS(BaseGCS):
         if best_path is None:
             return None, results_dict
 
-        # Extract trajectory control points (and waypoint passage times/positions)
+        # Extract trajectory control points (and waypoint passage order/times/positions)
         knots = np.zeros(self.order + 1)
         path_control_points = []
         time_control_points = []
         waypoint_times = [None] * len(self.waypoints)
         waypoint_positions = [None] * len(self.waypoints)
+        visit_order = []
 
         for edge in best_path:
             if edge.id() in self.waypoint_edge_to_idx:
                 wp_idx = self.waypoint_edge_to_idx[edge.id()]
+                visit_order.append(wp_idx)
                 xu_sol = best_result.GetSolution(edge.xu())
                 waypoint_positions[wp_idx] = xu_sol[
                     -(self.dimension + self.order + 1) : -(self.order + 1)
@@ -544,6 +559,7 @@ class BezierGCS(BaseGCS):
 
         if len(self.waypoints) > 0:
             offset_scalar = float(np.squeeze(offset))
+            results_dict["visit_order"] = visit_order
             results_dict["waypoint_times"] = [
                 t - offset_scalar if t is not None else None
                 for t in waypoint_times

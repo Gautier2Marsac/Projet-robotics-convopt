@@ -194,46 +194,71 @@ class BaseGCS:
         ]
 
     def findWaypointTransitionEdges(
-        self, waypoints, radii=None, allow_cross_region=True
+        self, waypoints, radii=None, allow_cross_region=True, ordered=True
     ):
         """
-        Compute inter-layer transition edges for an ordered sequence of waypoints.
+        Compute inter-layer transition edges for a sequence/set of waypoints.
 
-        For waypoint w_k (k = 0, ..., N-1), connects layer k to layer k+1 across
-        regions containing w_k (or intersecting B(w_k, radii[k])).
+        - If ordered=True (num_layers == N + 1):
+            connects layer k to layer k + 1 through regions containing waypoints[k].
+        - If ordered=False (TSP Bitmask DAG, num_layers == 2**N):
+            for every visited-subset bitmask `mask` and every unvisited waypoint k,
+            connects layer `mask` to layer `mask | (1 << k)` through regions
+            containing waypoints[k].
 
-        Returns a list of tuples: (layer, u_idx, v_idx, waypoint, radius).
+        Returns a list of tuples: (wp_idx, u_idx, v_idx, waypoint, radius).
         """
-        if len(waypoints) != self.num_layers - 1:
+        num_wp = len(waypoints)
+        expected_layers = (num_wp + 1) if ordered else (1 << num_wp)
+        if self.num_layers != expected_layers:
             raise ValueError(
-                f"Expected {self.num_layers - 1} waypoints for {self.num_layers} layers, "
-                f"got {len(waypoints)}."
+                f"Expected {expected_layers} layers for {num_wp} waypoints "
+                f"(ordered={ordered}), got {self.num_layers}."
             )
 
         if radii is None:
-            radii = [0.0] * len(waypoints)
+            radii = [0.0] * num_wp
         elif isinstance(radii, (int, float)):
-            radii = [float(radii)] * len(waypoints)
+            radii = [float(radii)] * num_wp
         else:
-            assert len(radii) == len(waypoints)
+            assert len(radii) == num_wp
 
-        transition_edges = []
+        # Precompute safe regions and valid (ii, jj) region pairs for each waypoint
+        wp_data = []
         for k, (wp, rad) in enumerate(zip(waypoints, radii)):
-            wp = np.asarray(wp, dtype=float)
-            wp_regions = self.findWaypointRegions(wp, radius=rad)
+            wp_arr = np.asarray(wp, dtype=float)
+            wp_regions = self.findWaypointRegions(wp_arr, radius=rad)
             if len(wp_regions) == 0:
                 raise ValueError(
-                    f"Waypoint {k} ({wp}) with radius {rad} is not contained in any safe region."
+                    f"Waypoint {k} ({wp_arr}) with radius {rad} is not contained in any safe region."
                 )
+            region_pairs = [
+                (ii, jj)
+                for ii in wp_regions
+                for jj in wp_regions
+                if (allow_cross_region or ii == jj)
+                and (ii == jj or self.regions[ii].IntersectsWith(self.regions[jj]))
+            ]
+            wp_data.append((wp_arr, float(rad), region_pairs))
 
-            for ii in wp_regions:
-                for jj in wp_regions:
-                    if not allow_cross_region and ii != jj:
-                        continue
-                    if ii == jj or self.regions[ii].IntersectsWith(self.regions[jj]):
-                        u_idx = self.vertexIndex(k, ii)
-                        v_idx = self.vertexIndex(k + 1, jj)
-                        transition_edges.append((k, u_idx, v_idx, wp, float(rad)))
+        transition_edges = []
+        if ordered:
+            for k, (wp_arr, rad, region_pairs) in enumerate(wp_data):
+                for ii, jj in region_pairs:
+                    u_idx = self.vertexIndex(k, ii)
+                    v_idx = self.vertexIndex(k + 1, jj)
+                    transition_edges.append((k, u_idx, v_idx, wp_arr, rad))
+        else:
+            for mask in range(1 << num_wp):
+                for k in range(num_wp):
+                    if mask & (1 << k):
+                        continue  # Waypoint k already visited in this state
+                    next_mask = mask | (1 << k)
+                    wp_arr, rad, region_pairs = wp_data[k]
+                    for ii, jj in region_pairs:
+                        u_idx = self.vertexIndex(mask, ii)
+                        v_idx = self.vertexIndex(next_mask, jj)
+                        transition_edges.append((k, u_idx, v_idx, wp_arr, rad))
 
         return transition_edges
 
